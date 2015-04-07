@@ -9,11 +9,12 @@ localparam C_M_AXI_LITE_STRB_WIDTH          = 32;
 localparam C_MSIX_TABLE_OFFSET              = 32'h0;
 localparam C_MSIX_PBA_OFFSET                = 32'h100; /* PBA = Pending bit array */
 localparam C_NUM_IRQ_INPUTS                 = 4;
+localparam SIM_NUM_IRQ                      = 6;
 
 
 reg                                clk;
 reg                                rst_n;
-reg  [3:0]                         watchdog;
+reg  [SIM_NUM_IRQ-1:0]             watchdog;
 reg  [C_M_AXI_LITE_ADDR_WIDTH-1:0] s_mem_iface_waddr;
 reg  [C_M_AXI_LITE_ADDR_WIDTH-1:0] s_mem_iface_raddr;
 reg  [C_M_AXI_LITE_DATA_WIDTH-1:0] s_mem_iface_wdata;
@@ -108,6 +109,9 @@ initial begin
   s_mem_iface_waddr = 0;
   s_mem_iface_raddr = 0;
   s_mem_iface_we = 1'b0;
+  watchdog       = {SIM_NUM_IRQ{1'h0}};
+  cfg_interrupt_msix_sent = 1'b0;
+  s_mem_iface_wdata = 0;
   #25
   rst_n = 1;
   
@@ -156,11 +160,11 @@ initial begin
   irq <= 4'b0;
 
   fork
-    watchdog[3] <= #300 1'b1;
+    watchdog[SIM_NUM_IRQ-1] <= #300 1'b1;
   join
 
   @(posedge cfg_interrupt_msix_int or posedge watchdog[3]);
-  if( watchdog[3] ) begin
+  if( watchdog[SIM_NUM_IRQ-1] ) begin
     $display("IRQ wasnt asserted"); 
     $finish();
   end 
@@ -168,13 +172,12 @@ initial begin
   #10
   cfg_interrupt_msix_sent <= 1'b0;
   #50
-  irq <= 4'b0010;
-  
+  irq <= 4'b1011;
   #10
   irq <= 4'b0;
   
 
-  for(i=0; i<3; i=i+1) begin 
+  for(i=0; i<SIM_NUM_IRQ-1; i=i+1) begin 
     fork
       watchdog[i] <= #300 1'b1;
     join

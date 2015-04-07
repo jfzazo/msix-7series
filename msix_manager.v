@@ -161,7 +161,8 @@ module msix_manager_br #(
   reg  [31:0] cfg_interrupt_msix_address_msb,cfg_interrupt_msix_address_lsb;
   assign cfg_interrupt_msix_address = {cfg_interrupt_msix_address_msb, cfg_interrupt_msix_address_lsb};
 
-  reg [C_NUM_IRQ_INPUTS-1:0] irq_s; // List of asked IRQs by the user. The IRQs are acumulated in this vector.
+  reg     [C_NUM_IRQ_INPUTS-1:0] irq_s;     // List of asked IRQs by the user. The IRQs are acumulated in this vector.
+  integer irq_count [C_NUM_IRQ_INPUTS-1:0]; // Number of IRQs to generate of each type.
   reg [31:0]                irq_pba, current_pba; 
   reg [3:0]                 state;
   reg [3:0]                 next_state;
@@ -175,21 +176,137 @@ module msix_manager_br #(
   localparam ACTIVE_IRQ = 4'b0111;
   localparam CLEAR_PBA  = 4'b1000;
   localparam WAIT       = 4'b1111;
+  
+  /* 
+    This process will activate the cfg_interrupt_msix_int signal when necessary.
+    It also counts the number of IRQs asked by the external design.
+  */
   always @(negedge rst_n or posedge clk) begin
     if(~rst_n) begin
-      cfg_interrupt_msix_int <= 1'b0;
       irq_s                  <= {C_NUM_IRQ_INPUTS{1'b0}};
-      irq_pba                <= 32'h0; //Position in the PBA (position in a  32 bit vector)
+      cfg_interrupt_msix_int <= 1'b0;
+      for(i=0; i<C_NUM_IRQ_INPUTS; i=i+1) begin
+        irq_count[i] <= 0;
+      end
+    end else begin
+      case(state) 
+        ACTIVE_IRQ: begin
+          for(i=0; i<C_NUM_IRQ_INPUTS; i=i+1) begin
+            if(irq_number==i) begin
+              irq_count[i] <= irq_count[i] +  irq[i] - 1;
+            end else begin
+              irq_count[i] <= irq_count[i] +  irq[i];
+            end
+          end
+          for(i=0; i<C_NUM_IRQ_INPUTS; i=i+1) begin
+            if(irq_number==i && irq_count[irq_number] == 1 ) begin
+              irq_s[i] <= 1'b0;
+            end else begin
+              irq_s[i]   <= irq[i] | irq_s[i];
+            end
+          end
+          cfg_interrupt_msix_int <= 1'b1;
+        end
 
-      cfg_interrupt_msix_data    <= 32'h0; 
+        default: begin
+          for(i=0; i<C_NUM_IRQ_INPUTS; i=i+1) begin
+            irq_count[i] <= irq_count[i] +  irq[i];
+          end
+          irq_s                  <= irq | irq_s;
+          cfg_interrupt_msix_int <= 1'b0;
+        end
+      endcase
+    end
+  end
+
+  /* This process is in charge of updating the registers:
+
+        cfg_interrupt_msix_data        
+        cfg_interrupt_msix_address_msb 
+        cfg_interrupt_msix_address_lsb 
+        current_pba           
+
+    with the information read from the bram
+  */
+  always @(negedge rst_n or posedge clk) begin
+    if(~rst_n) begin
+      cfg_interrupt_msix_data        <= 32'h0; 
       cfg_interrupt_msix_address_msb <= 32'h0; 
       cfg_interrupt_msix_address_lsb <= 32'h0; 
-      dia <= 32'h0; 
+      current_pba                    <= 32'h0;
+    end else begin
+      case(state) 
+        GET_ADDR2: begin
+          cfg_interrupt_msix_address_lsb <= doa; 
+        end
+        GET_DATA: begin
+          cfg_interrupt_msix_address_msb <= doa; 
+        end
+
+        READ_PBA: begin
+          cfg_interrupt_msix_data        <= doa; 
+        end
+        WRITE_PBA: begin
+          current_pba                    <= doa;
+        end
+        default: begin
+          cfg_interrupt_msix_data        <= cfg_interrupt_msix_data; 
+          cfg_interrupt_msix_address_msb <= cfg_interrupt_msix_address_msb; 
+          cfg_interrupt_msix_address_lsb <= cfg_interrupt_msix_address_lsb; 
+          current_pba                    <= current_pba;
+        end
+      endcase
+    end
+  end
+
+  /*
+     This process is in charge of updating the BRAM memory (PBA) 
+    with the current pending IRQ. It enables the write signal 
+    and writes to dia the new value. The direction is specified in the
+    next process.
+  */
+  always @(negedge rst_n or posedge clk) begin
+    if(~rst_n) begin
+      dia     <= 32'h0; 
+      enawren <= 1'b0;
+    end else begin
+      case(state)
+        WRITE_PBA: begin
+          dia     <= doa | irq_pba;
+          enawren <= 1'b1;
+        end
+        CLEAR_PBA: begin
+          if(cfg_interrupt_msix_sent || cfg_interrupt_msix_fail) begin
+            enawren     <= 1'b1;
+            dia         <= current_pba & (~irq_pba); 
+          end else begin
+            enawren     <= 1'b0;
+            dia         <= dia;
+          end
+        end
+        WAIT: begin
+          enawren <= enawren;
+          dia     <= dia;
+        end
+        default: begin
+          enawren <= 1'b0;
+          dia     <= dia;
+        end
+      endcase
+    end
+  end
+  
+
+  /*
+    Main FSM. It will assign the PORT A of the BRAM the corresponding direction
+    (MSI-x table IRQ data and address and PBA position) according with the current state.
+  */
+  always @(negedge rst_n or posedge clk) begin
+    if(~rst_n) begin
       state                  <= IDLE;
       next_state             <= IDLE;
       irq_number             <= 0;
-      enawren                <= 1'b0;
-      current_pba            <= 32'h0;
+      irq_pba                <= 32'h0; //Position in the PBA (position in a  32 bit vector)      
     end else begin
       case(state) 
         IDLE: begin /* Check if new IRQs has been asked. */
@@ -199,9 +316,7 @@ module msix_manager_br #(
             state   <= IDLE;
           end
 
-          irq_s   <= irq | irq_s;
           irq_number <= 0;
-          enawren    <= 1'b0;
         end
         TO_BINARY:begin  /* Choose one of the asked IRQs (First bit  active from the left. ) */
           for(i=0; i<C_NUM_IRQ_INPUTS; i=i+1) begin
@@ -210,87 +325,55 @@ module msix_manager_br #(
               irq_pba    <= (1<<(i%32));
             end 
           end
-          irq_s   <= irq_s | irq;
+
           state   <= GET_ADDR1;
         end
         GET_ADDR1: begin /* Read from the RAM address and data*/
           addrardaddr <= 9'h0 + C_MSIX_TABLE_OFFSET  + irq_number*9'h10;
-          state         <= WAIT;
-          next_state    <= GET_ADDR2;
 
-          irq_s   <= irq_s | irq;
+          state       <= WAIT;
+          next_state  <= GET_ADDR2;
         end
         GET_ADDR2: begin
-          cfg_interrupt_msix_address_lsb <= doa; 
           addrardaddr <= 9'h4 + C_MSIX_TABLE_OFFSET  + irq_number*9'h10;
-          state         <= WAIT;
-          next_state    <= GET_DATA;
-          irq_s   <= irq_s | irq;
+
+          state       <= WAIT;
+          next_state  <= GET_DATA;
         end
         GET_DATA: begin
-          cfg_interrupt_msix_address_msb <= doa; 
           addrardaddr <= 9'h8 + C_MSIX_TABLE_OFFSET  + irq_number*9'h10;
 
-          state         <= WAIT;
-          next_state    <= READ_PBA;
-
-          irq_s   <= irq_s | irq;
+          state       <= WAIT;
+          next_state  <= READ_PBA;
         end
         READ_PBA: begin /* Get the previous value of the PBA */
-          cfg_interrupt_msix_data    <= doa; 
-
-          state                      <= WAIT;
-          next_state                 <= WRITE_PBA;
-
           addrardaddr <= C_MSIX_PBA_OFFSET  + ((irq_number/32)<<2);
 
-          irq_s   <= irq_s | irq;
+          state       <= WAIT;
+          next_state  <= WRITE_PBA;
         end
         WRITE_PBA: begin /* Add the current IRQ to the PBA */
-          state         <= WAIT;
-          next_state    <= ACTIVE_IRQ;
+          addrardaddr <= C_MSIX_PBA_OFFSET  + ((irq_number/32)<<2); 
 
-          enawren       <= 1'b1;
-
-          addrardaddr <= C_MSIX_PBA_OFFSET  + ((irq_number/32)<<2);
-          dia           <= doa | irq_pba; 
-          current_pba   <= doa;
-          irq_s         <= irq_s | irq;
+          state       <= WAIT;
+          next_state  <= ACTIVE_IRQ;
         end
         ACTIVE_IRQ: begin /* Activate IRQ and remove the IRQ from the list irq_s */
-          enawren                    <= 1'b0;
-          cfg_interrupt_msix_int     <= 1'b1;
           state                      <= CLEAR_PBA;
-
-          for(i=0; i<C_NUM_IRQ_INPUTS; i=i+1) begin
-            if(irq_number==i) begin
-              irq_s[irq_number] <= 1'b0;
-            end else begin
-              irq_s[i]   <= irq[i] | irq_s[i];
-            end
-          end
         end
         CLEAR_PBA: begin /* Remove the IRQ from the PBA */
-          cfg_interrupt_msix_int     <= 1'b0;
-          irq_s         <= irq_s | irq;
-
           if(cfg_interrupt_msix_sent || cfg_interrupt_msix_fail) begin
-            enawren     <= 1'b1;
             addrardaddr <= C_MSIX_PBA_OFFSET  + ((irq_number/32)<<2);
-            dia         <= current_pba & (~irq_pba); 
-
-            state         <= WAIT;
-            next_state    <= IDLE;
+            
+            state       <= WAIT;
+            next_state  <= IDLE;
           end else begin
-            state         <= CLEAR_PBA;
+            state       <= CLEAR_PBA;
           end
         end
-
-
         WAIT: begin // one cycle must be wait because addrardaddr is a register. 
                     // The bram will get the correct address in the next pulse.
           state   <= next_state;
-          irq_s   <= irq_s | irq;
         end
         default: begin
           state                    <= IDLE;
